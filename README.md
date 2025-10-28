@@ -14,7 +14,7 @@ An intelligent Excel data analysis application powered by AI. Upload your Excel 
 
 ## 🏗️ Architecture
 
-The application uses a multi-agent architecture built with OpenAI Agents SDK:
+The application uses a multi-agent architecture built with OpenAI Agents SDK and Model Context Protocol (MCP):
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -27,19 +27,27 @@ The application uses a multi-agent architecture built with OpenAI Agents SDK:
 │              Excel Orchestrator Agent (Main)                 │
 │  - Interprets natural language queries                       │
 │  - Generates Python code for analysis                        │
-│  - Coordinates tool execution                                │
-│  - Returns formatted results                                 │
+│  - Uses MCP tool: execute_python_code                        │
+│  - Can handoff to WebSearchAgent when needed                 │
 └───────────┬─────────────────────────────┬───────────────────┘
-            │                             │
+            │                             │ (native handoff)
             ▼                             ▼
 ┌───────────────────────┐    ┌──────────────────────────────┐
-│  Python Sandbox Tool  │    │    WebSearch Agent           │
-│  - AST Validation     │    │  - DuckDuckGo search         │
-│  - Safe exec()        │    │  - Documentation lookup      │
-│  - pandas/numpy       │    │  - Code examples             │
-│  - matplotlib/seaborn │    │                              │
-└───────────────────────┘    └──────────────────────────────┘
+│  MCP Server (stdio)   │    │    WebSearch Agent           │
+│  execute_python_code  │    │  - Uses MCP tool: search_web │
+│  → Python Sandbox     │    │  - DuckDuckGo search         │
+│    - AST Validation   │    │  - Documentation lookup      │
+│    - Safe exec()      │    │  - Returns control after     │
+│    - pandas/numpy     │    │                              │
+│    - matplotlib       │    └──────────────────────────────┘
+└───────────────────────┘
 ```
+
+**Key Features**:
+- **MCP (Model Context Protocol)**: Standardized tool exposure via stdio servers
+- **Native Handoff**: Orchestrator can delegate to WebSearchAgent automatically
+- **Tool Filtering**: Each agent has access only to its designated tools
+- **Automatic Recovery**: On errors, orchestrator hands off to WebSearch for help
 
 ### Project Structure
 
@@ -48,10 +56,11 @@ excel-analyst-agent/
 ├── app.py                          # Gradio UI entry point
 ├── requirements.txt                # Python dependencies
 ├── README.md                       # This file
-└── agents/
+└── app_agents/
     ├── __init__.py
     ├── orchestrator.py             # Main Excel Analyst Agent
     ├── web_agent.py                # Web Search Support Agent
+    ├── mcp_server.py               # MCP stdio server (FastMCP)
     └── tools/
         ├── __init__.py
         ├── python_tool.py          # Python Sandbox with AST validation
@@ -60,26 +69,35 @@ excel-analyst-agent/
 
 ### Components
 
-1. **Excel Orchestrator Agent** (`agents/orchestrator.py`)
+1. **Excel Orchestrator Agent** (`app_agents/orchestrator.py`)
    - Main agent that interprets user queries
    - Generates Python code for data analysis
    - Uses OpenAI GPT-4o-mini model
-   - Delegates to tools and sub-agents as needed
+   - Connects to MCP server for execute_python_code tool
+   - Can handoff to WebSearchAgent when errors occur
 
-2. **WebSearch Agent** (`agents/web_agent.py`)
+2. **WebSearch Agent** (`app_agents/web_agent.py`)
    - Support agent for finding documentation
+   - Connects to MCP server for search_web tool
    - Uses DuckDuckGo for web searches
-   - Returns summarized, actionable information
+   - Returns control to orchestrator after providing info
 
-3. **Python Sandbox Tool** (`agents/tools/python_tool.py`)
+3. **MCP Server** (`app_agents/mcp_server.py`)
+   - FastMCP-based stdio server
+   - Exposes two tools: execute_python_code and search_web
+   - Lazy-loads tool implementations for fast startup
+   - Tool filtering ensures each agent sees only its tools
+
+4. **Python Sandbox Tool** (`app_agents/tools/python_tool.py`)
    - Secure code execution environment
    - AST (Abstract Syntax Tree) validation for security
    - Safe `exec()` with controlled namespace
    - Supports pandas, numpy, matplotlib, seaborn
+   - Includes exception types (ValueError, TypeError, etc.)
    - 30-second timeout limit via ThreadPoolExecutor
    - Captures outputs, dataframes, and visualizations
 
-4. **Web Search Tool** (`agents/tools/web_search_tool.py`)
+5. **Web Search Tool** (`app_agents/tools/web_search_tool.py`)
    - DuckDuckGo integration
    - No API key required
    - Returns top 5 search results
@@ -164,10 +182,16 @@ agent = ExcelOrchestratorAgent(api_key=used_api_key, model="gpt-4o")
 
 ### Timeout Settings
 
-Code execution timeout is set to 30 seconds by default. To change it, modify `agents/tools/python_tool.py`:
+Code execution timeout is set to 30 seconds by default. To change it, modify `app_agents/mcp_server.py`:
 
 ```python
-self.python_tool = PythonSandboxTool(timeout=60)  # 60 seconds
+_python_tool = PythonSandboxTool(timeout=60)  # 60 seconds
+```
+
+Agent execution has a maximum of 20 turns (configurable in `app_agents/orchestrator.py`):
+
+```python
+return await Runner.run(orchestrator, msg, max_turns=20)
 ```
 
 ## 🌐 Deployment
@@ -241,7 +265,8 @@ The application implements multiple security layers:
 ## 📦 Dependencies
 
 - `gradio` - Web interface
-- `openai>=1.12.0` - OpenAI Agents SDK
+- `openai-agents` - OpenAI Agents SDK with MCP support
+- `fastmcp` - FastMCP for building MCP servers
 - `pandas>=2.0.0` - Data manipulation
 - `numpy>=1.24.0` - Numerical computing
 - `openpyxl>=3.1.0` - Excel file support
@@ -289,7 +314,13 @@ class CodeValidator(ast.NodeVisitor):
 ### Execution Flow
 
 ```
-User Query → OpenAI Agent → Python Code
+User Query → Gradio UI → ExcelOrchestrator Agent
+                                ↓
+                    Generate Python Code
+                                ↓
+                    Call MCP Tool: execute_python_code
+                                ↓
+                    MCP Server (stdio) → PythonSandboxTool
                                 ↓
                           AST Validation
                                 ↓
@@ -298,6 +329,20 @@ User Query → OpenAI Agent → Python Code
                     Execute in ThreadPoolExecutor
                                 ↓
                   Capture: stdout, dataframes, plots
+                                ↓
+                    Return JSON to MCP Server
+                                ↓
+            MCP Server → ExcelOrchestrator Agent
+                                ↓
+                        Parse Results
+                                ↓
+              (If error) → Handoff to WebSearchAgent
+                                ↓
+                    WebSearchAgent searches web
+                                ↓
+                Returns control with documentation
+                                ↓
+            ExcelOrchestrator executes corrected code
                                 ↓
                         Return to Gradio UI
 ```
