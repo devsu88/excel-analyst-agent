@@ -189,6 +189,22 @@ class PythonSandboxTool:
             'False': False,
             'None': None,
             '__import__': self._safe_import,  # Enable safe imports
+            # Exception types (necessary for try/except blocks)
+            'Exception': Exception,
+            'ValueError': ValueError,
+            'TypeError': TypeError,
+            'KeyError': KeyError,
+            'IndexError': IndexError,
+            'AttributeError': AttributeError,
+            'RuntimeError': RuntimeError,
+            'ImportError': ImportError,
+            'ZeroDivisionError': ZeroDivisionError,
+            # Additional useful builtins
+            'locals': locals,
+            'globals': lambda: safe_builtins,  # Return safe version
+            'dir': dir,
+            'any': any,
+            'all': all,
         }
         
         safe_dict = {
@@ -260,6 +276,15 @@ class PythonSandboxTool:
                 logger.error(f"Validation errors: {validator.errors}")
                 return result
             
+            # Configure pandas display to avoid truncated columns/rows in printed output
+            try:
+                pd.set_option('display.max_columns', None)
+                pd.set_option('display.width', 2000)
+                pd.set_option('display.max_colwidth', None)
+                pd.set_option('display.expand_frame_repr', False)
+            except Exception:
+                pass
+
             # Compile the validated code
             byte_code = compile(tree, filename='<user_code>', mode='exec')
             
@@ -288,10 +313,12 @@ class PythonSandboxTool:
                 
                 # Check for dataframe in the namespace
                 if 'df' in safe_dict and isinstance(safe_dict['df'], pd.DataFrame):
-                    # Convert dataframe to dict for JSON serialization
-                    result['dataframe'] = safe_dict['df'].head(5).to_dict('records')
+                    # Convert dataframe to dict and make it JSON-safe
+                    records = safe_dict['df'].head(5).to_dict('records')
+                    result['dataframe'] = self._make_json_safe_records(records)
                 elif 'result' in safe_dict and isinstance(safe_dict['result'], pd.DataFrame):
-                    result['dataframe'] = safe_dict['result'].head(5).to_dict('records')
+                    records = safe_dict['result'].head(5).to_dict('records')
+                    result['dataframe'] = self._make_json_safe_records(records)
                 
                 # Capture matplotlib figures
                 figures = [plt.figure(i) for i in plt.get_fignums()]
@@ -328,6 +355,39 @@ class PythonSandboxTool:
         logger.info(f"Result: {result}")
         
         return result
+
+    def _make_json_safe_records(self, records):
+        """
+        Convert a list of dict records into JSON-serializable values:
+        - pandas.Timestamp -> ISO string
+        - numpy types -> native Python
+        - NaN -> None
+        """
+        import math
+        from datetime import datetime
+
+        def to_safe(value):
+            if isinstance(value, pd.Timestamp):
+                return value.isoformat()
+            if isinstance(value, datetime):
+                return value.isoformat()
+            if isinstance(value, np.generic):
+                # numpy scalar -> native python
+                py = value.item()
+                if isinstance(py, float) and (math.isnan(py) or py == float('inf') or py == float('-inf')):
+                    return None
+                return py
+            if isinstance(value, float):
+                if math.isnan(value) or value == float('inf') or value == float('-inf'):
+                    return None
+                return value
+            return value
+
+        safe_records = []
+        for rec in records or []:
+            safe_rec = {k: to_safe(v) for k, v in rec.items()}
+            safe_records.append(safe_rec)
+        return safe_records
     
     def get_tool_definition(self) -> Dict[str, Any]:
         """
@@ -353,5 +413,6 @@ class PythonSandboxTool:
                 }
             }
         }
+
 
 
