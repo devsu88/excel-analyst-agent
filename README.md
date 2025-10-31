@@ -8,7 +8,7 @@ An intelligent Excel data analysis application powered by AI. Upload your Excel 
 - **Automatic Code Generation**: AI generates Python code to fulfill your requests
 - **Data Analysis**: Perform complex data manipulation and statistical analysis
 - **Visualizations**: Automatic chart and graph generation
-- **Multi-Agent System**: Orchestrator agent with web search capability
+- **Multi-Agent System**: MasterAgent coordinates ExcelAnalysisAgent and WebSearchAgent
 - **Secure Execution**: Sandboxed Python environment with restricted access
 - **User-Friendly Interface**: Clean Gradio web interface
 
@@ -24,30 +24,31 @@ The application uses a multi-agent architecture built with OpenAI Agents SDK and
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              Excel Orchestrator Agent (Main)                 │
-│  - Interprets natural language queries                       │
-│  - Generates Python code for analysis                        │
-│  - Uses MCP tool: execute_python_code                        │
-│  - Can handoff to WebSearchAgent when needed                 │
+│                 Master Agent (Coordinator)                   │
+│  - Orchestrates analysis workflow                            │
+│  - Delegates to agents/tools as needed                       │
 └───────────┬─────────────────────────────┬───────────────────┘
-            │                             │ (native handoff)
+            │                             │
             ▼                             ▼
-┌───────────────────────┐    ┌──────────────────────────────┐
-│  MCP Server (stdio)   │    │    WebSearch Agent           │
-│  execute_python_code  │    │  - Uses MCP tool: search_web │
-│  → Python Sandbox     │    │  - DuckDuckGo search         │
-│    - AST Validation   │    │  - Documentation lookup      │
-│    - Safe exec()      │    │  - Returns control after     │
-│    - pandas/numpy     │    │                              │
-│    - matplotlib       │    └──────────────────────────────┘
+┌──────────────────────────────┐   ┌───────────────────────────┐
+│       ExcelAnalysisAgent     │   │      WebSearchAgent       │
+│  - Uses MCP: execute_python_code  │   │  - Uses MCP: search_web      │
+│  - Python Sandbox via MCP Server  │   │  - DuckDuckGo documentation   │
+└───────────┬───────────────────┘   └──────────────────────────┘
+            │
+            ▼
+┌───────────────────────┐
+│   MCP Server (stdio)  │
+│  - PythonSandboxTool  │
+│  - WebSearchTool      │
 └───────────────────────┘
 ```
 
 **Key Features**:
 - **MCP (Model Context Protocol)**: Standardized tool exposure via stdio servers
-- **Native Handoff**: Orchestrator can delegate to WebSearchAgent automatically
-- **Tool Filtering**: Each agent has access only to its designated tools
-- **Automatic Recovery**: On errors, orchestrator hands off to WebSearch for help
+- **Master Orchestration**: MasterAgent coordinates specialized agents
+- **Tool Filtering**: Each agent sees only its designated tools
+- **Assisted Recovery**: On errors, MasterAgent consults WebSearchAgent for help
 
 ### Project Structure
 
@@ -58,8 +59,9 @@ excel-analyst-agent/
 ├── README.md                       # This file
 └── app_agents/
     ├── __init__.py
-    ├── orchestrator.py             # Main Excel Analyst Agent
-    ├── web_agent.py                # Web Search Support Agent
+    ├── master_agent.py             # Master agent (coordinator)
+    ├── excel_agent.py              # Excel analysis agent (no handoff)
+    ├── web_agent.py                # Web Search support agent
     ├── mcp_server.py               # MCP stdio server (FastMCP)
     └── tools/
         ├── __init__.py
@@ -69,37 +71,34 @@ excel-analyst-agent/
 
 ### Components
 
-1. **Excel Orchestrator Agent** (`app_agents/orchestrator.py`)
-   - Main agent that interprets user queries
-   - Generates Python code for data analysis
-   - Uses OpenAI GPT-4o-mini model
-   - Connects to MCP server for execute_python_code tool
-   - Can handoff to WebSearchAgent when errors occur
+1. **Master Agent** (`app_agents/master_agent.py`)
+   - Coordinates specialized agents
+   - Decides when to consult WebSearchAgent
+   - Retries analysis with web context when helpful
 
-2. **WebSearch Agent** (`app_agents/web_agent.py`)
-   - Support agent for finding documentation
-   - Connects to MCP server for search_web tool
-   - Uses DuckDuckGo for web searches
-   - Returns control to orchestrator after providing info
+2. **Excel Analysis Agent** (`app_agents/excel_agent.py`)
+   - Interprets user queries
+   - Generates and executes Python code for analysis
+   - Uses MCP tool `execute_python_code`
 
-3. **MCP Server** (`app_agents/mcp_server.py`)
+3. **WebSearch Agent** (`app_agents/web_agent.py`)
+   - Finds documentation and examples
+   - Uses MCP tool `search_web`
+   - Provides context to MasterAgent
+
+4. **MCP Server** (`app_agents/mcp_server.py`)
    - FastMCP-based stdio server
-   - Exposes two tools: execute_python_code and search_web
+   - Exposes tools: `execute_python_code` and `search_web`
    - Lazy-loads tool implementations for fast startup
    - Tool filtering ensures each agent sees only its tools
 
-4. **Python Sandbox Tool** (`app_agents/tools/python_tool.py`)
-   - Secure code execution environment
-   - AST (Abstract Syntax Tree) validation for security
-   - Safe `exec()` with controlled namespace
+5. **Python Sandbox Tool** (`app_agents/tools/python_tool.py`)
+   - Secure execution with AST validation and controlled namespace
    - Supports pandas, numpy, matplotlib, seaborn
-   - Includes exception types (ValueError, TypeError, etc.)
-   - 30-second timeout limit via ThreadPoolExecutor
-   - Captures outputs, dataframes, and visualizations
+   - 30-second timeout and captures output/figures
 
-5. **Web Search Tool** (`app_agents/tools/web_search_tool.py`)
-   - DuckDuckGo integration
-   - No API key required
+6. **Web Search Tool** (`app_agents/tools/web_search_tool.py`)
+   - DuckDuckGo integration (no API key required)
    - Returns top 5 search results
 
 ## 🚀 Installation
@@ -177,7 +176,7 @@ The interface will be available at `http://localhost:7860`
 By default, the application uses `gpt-4o-mini`. To change the model, edit the initialization in `app.py`:
 
 ```python
-agent = ExcelOrchestratorAgent(api_key=used_api_key, model="gpt-4o")
+agent = MasterAgent(api_key=used_api_key, model="gpt-4o")
 ```
 
 ### Timeout Settings
@@ -188,10 +187,10 @@ Code execution timeout is set to 30 seconds by default. To change it, modify `ap
 _python_tool = PythonSandboxTool(timeout=60)  # 60 seconds
 ```
 
-Agent execution has a maximum of 20 turns (configurable in `app_agents/orchestrator.py`):
+Agent execution has a maximum of 20 turns (configurable in `app_agents/excel_agent.py`):
 
 ```python
-return await Runner.run(orchestrator, msg, max_turns=20)
+return await Runner.run(excel_agent, msg, max_turns=20)
 ```
 
 ## 🌐 Deployment
@@ -314,37 +313,27 @@ class CodeValidator(ast.NodeVisitor):
 ### Execution Flow
 
 ```
-User Query → Gradio UI → ExcelOrchestrator Agent
-                                ↓
-                    Generate Python Code
-                                ↓
-                    Call MCP Tool: execute_python_code
-                                ↓
-                    MCP Server (stdio) → PythonSandboxTool
-                                ↓
-                          AST Validation
-                                ↓
-                          Compile (if safe)
-                                ↓
-                    Execute in ThreadPoolExecutor
-                                ↓
-                  Capture: stdout, dataframes, plots
-                                ↓
-                    Return JSON to MCP Server
-                                ↓
-            MCP Server → ExcelOrchestrator Agent
-                                ↓
-                        Parse Results
-                                ↓
-              (If error) → Handoff to WebSearchAgent
-                                ↓
-                    WebSearchAgent searches web
-                                ↓
-                Returns control with documentation
-                                ↓
-            ExcelOrchestrator executes corrected code
-                                ↓
-                        Return to Gradio UI
+User Query → Gradio UI → MasterAgent
+                           ↓
+                 Try ExcelAnalysisAgent
+                           ↓
+             Call MCP Tool: execute_python_code
+                           ↓
+             MCP Server → PythonSandboxTool
+                           ↓
+                     Parse / Validate / Execute
+                           ↓
+                 Capture stdout/dataframes/plots
+                           ↓
+                 If insufficient or error →
+                           ↓
+                 MasterAgent calls WebSearchAgent
+                           ↓
+                Get docs/examples from search_web
+                           ↓
+         MasterAgent augments prompt and retries Excel
+                           ↓
+                     Return results to UI
 ```
 
 ## 🐛 Troubleshooting
