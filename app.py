@@ -12,7 +12,7 @@ import gradio as gr
 import pandas as pd
 from PIL import Image
 from dotenv import load_dotenv
-from app_agents.orchestrator import ExcelOrchestratorAgent
+from app_agents.master_agent import MasterAgent
 
 # Load environment variables
 load_dotenv()
@@ -79,9 +79,9 @@ def process_analysis(
         if not (file_path.endswith('.xlsx') or file_path.endswith('.csv')):
             return "❌ Please upload a valid Excel (.xlsx) or CSV (.csv) file.", None, None
         
-        # Initialize the orchestrator agent
-        logger.info("Initializing Excel Orchestrator Agent...")
-        agent = ExcelOrchestratorAgent(api_key=used_api_key, model="gpt-4o-mini")
+        # Initialize the master agent
+        logger.info("Initializing Master Agent...")
+        agent = MasterAgent(api_key=used_api_key, model="gpt-4o-mini")
         
         # Analyze the file
         logger.info("Starting analysis...")
