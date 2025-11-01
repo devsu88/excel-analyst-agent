@@ -7,7 +7,7 @@ from fastmcp import FastMCP
 
 mcp = FastMCP("excel-tools")
 
-# Lazy singletons per evitare import pesanti in startup
+# Lazy singletons to avoid heavy imports at startup
 _python_tool = None
 _web_tool = None
 
@@ -21,7 +21,6 @@ def execute_python_code(code: str, file_path: str) -> str:
         from app_agents.tools.python_tool import PythonSandboxTool
         _python_tool = PythonSandboxTool(timeout=30)
     result = _python_tool.execute(code=code, file_path=file_path)
-    # Return JSON string
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -38,7 +37,7 @@ def search_web(query: str) -> str:
 
 
 if __name__ == "__main__":
-    # stdio è il default; lo specifichiamo esplicitamente per chiarezza
+    # stdio is the default; we specify it explicitly for clarity
     mcp.run(transport="stdio")
 
 

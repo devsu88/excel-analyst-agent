@@ -1,17 +1,17 @@
 """
-Master Agent - coordina ExcelAnalysisAgent e WebSearchAgent come strumenti
+Master Agent - coordinates ExcelAnalysisAgent and WebSearchAgent as tools
 """
 
 import logging
 import os
 import asyncio
+import json
 from typing import Dict, Any, Optional
 
 from agents import Agent, Runner
 from agents.mcp import MCPServerStdio, create_static_tool_filter
-from agents.model_settings import ModelSettings
 
-from .excel_agent import ExcelAnalysisAgent
+from .excel_agent import create_excel_agent
 from .web_agent import create_web_search_agent
 
 
@@ -19,16 +19,27 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+MASTER_AGENT_PROMPT = """
+You are the orchestrator of a multi-agent system. Your task is to take the user's query and the file path and pass it to the appropriate agent tool.
+
+Available agent tools:
+- excel_analysis_agent: Executes Python code for data analysis and visualization using pandas and matplotlib. 
+  When calling this tool, you MUST pass the complete user query and the file path so it can execute the correct analysis.
+- web_search_agent: Searches the web for documentation, examples, and solutions.
+
+Your strategy:
+1. First, try to use the excel_analysis_agent to directly answer the user's query using the file path.
+   IMPORTANT: When calling excel_analysis_agent, include the FULL user query in your message to the tool.
+2. If the analysis fails or needs additional context, use the web_search_agent to find relevant information.
+3. Use the web search results to guide a retry with the excel_analysis_agent.
+
+Always provide clear, actionable results to the user.
+"""
+
+
 class MasterAgent:
     """
-    Agente master che coordina:
-    - ExcelAnalysisAgent: esecuzione di codice Python tramite MCP execute_python_code
-    - WebSearchAgent: ricerca documentazione tramite MCP search_web
-
-    Strategia:
-    1) Prova l'analisi con l'ExcelAnalysisAgent
-    2) Se fallisce o l'output è insufficiente, interroga il WebSearchAgent
-    3) Ritenta l'analisi Excel con il contesto ottenuto dal web
+    Master agent that coordinates ExcelAnalysisAgent and WebSearchAgent as tools.
     """
 
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
@@ -36,76 +47,122 @@ class MasterAgent:
             os.environ["OPENAI_API_KEY"] = api_key
         self.model = model
 
-    def _run_web_search(self, query: str) -> Optional[str]:
+    def analyze(self, user_query: str, file_path: str) -> Dict[str, Any]:
         """
-        Esegue il WebSearchAgent come tool e ritorna il testo trovato
+        Coordinate the two agents to get the best possible result
         """
-        async def _arun(msg: str) -> Any:
-            server = MCPServerStdio(
+        async def _arun():
+            # Create MCP servers
+            python_server = MCPServerStdio(
+                name="excel-tools-python",
+                params={"command": "python", "args": ["-m", "app_agents.mcp_server"]},
+                cache_tools_list=True,
+                use_structured_content=True,
+                tool_filter=create_static_tool_filter(allowed_tool_names=["execute_python_code"]),
+            )
+            
+            web_server = MCPServerStdio(
                 name="excel-tools-web",
                 params={"command": "python", "args": ["-m", "app_agents.mcp_server"]},
                 cache_tools_list=True,
                 tool_filter=create_static_tool_filter(allowed_tool_names=["search_web"]),
             )
-            await server.connect()
+            
+            # Connect servers
+            await python_server.connect()
+            await web_server.connect()
+            
             try:
-                web_agent = create_web_search_agent(mcp_server=server, model=self.model)
-                result = await Runner.run(web_agent, msg)
+                # Create specialized agents using functions from their respective modules
+                excel_agent = create_excel_agent(mcp_server=python_server, model=self.model)
+                web_agent = create_web_search_agent(mcp_server=web_server, model=self.model)
+                
+                # Create orchestrator agent with other agents as tools
+                orchestrator = Agent(
+                    name="MasterAgent",
+                    model=self.model,
+                    instructions=MASTER_AGENT_PROMPT,
+                    tools=[
+                        excel_agent.as_tool(
+                            tool_name="excel_analysis_agent",
+                            tool_description="Execute Python code to analyze Excel/CSV files and create visualizations. The agent receives the user query and file path and must execute the exact analysis requested."
+                        ),
+                        web_agent.as_tool(
+                            tool_name="web_search_agent",
+                            tool_description="Search the web for up-to-date information, documentation, and code examples"
+                        ),
+                    ],
+                )
+                
+                # Prepare user message with file path
+                user_msg = (
+                    f"User query: {user_query}\n"
+                    f"File path: {file_path}\n\n"
+                    f"Call the excel_analysis_agent tool with this exact message:\n"
+                    f"'Analyze this request: {user_query}\\n\\nThe file is located at: {file_path}\\n\\n"
+                    f"Write Python code and call execute_python_code with that code and the same file_path.'\n\n"
+                    f"Make sure to pass the complete user query to the excel_analysis_agent so it can perform the correct analysis."
+                )
+                
+                # Run orchestrator
+                result = await Runner.run(orchestrator, user_msg, max_turns=20)
+                
                 return result
             finally:
-                close_fn = getattr(server, "close", None) or getattr(server, "aclose", None)
-                if close_fn:
-                    res = close_fn()
-                    if hasattr(res, "__await__"):
-                        await res
+                # Clean up servers
+                for server in [python_server, web_server]:
+                    close_fn = getattr(server, "close", None) or getattr(server, "aclose", None)
+                    if close_fn:
+                        res = close_fn()
+                        if hasattr(res, "__await__"):
+                            await res
 
-        loop = asyncio.new_event_loop()
         try:
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(_arun(f"Search for help about: {query}"))
-        finally:
-            loop.close()
-            asyncio.set_event_loop(None)
-        return getattr(result, "final_output", None)
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                result = loop.run_until_complete(_arun())
+            finally:
+                loop.close()
+                asyncio.set_event_loop(None)
 
-    def analyze(self, user_query: str, file_path: str) -> Dict[str, Any]:
-        """
-        Coordina i due agenti per ottenere il miglior risultato possibile
-        """
-        try:
-            excel = ExcelAnalysisAgent(api_key=os.environ.get("OPENAI_API_KEY", ""), model=self.model)
+            raw_output = result.final_output or ""
+            
+            # Extract dataframe and images from tool output
+            extracted_df = None
+            extracted_images = []
+            final_text = raw_output
+            
+            # Extract from result.new_items - Item 1 (ToolCallOutputItem) contains the JSON
+            for item in result.new_items:
+                if hasattr(item, 'output') and isinstance(item.output, str):
+                    # Extract JSON from markdown code blocks if present
+                    json_str = item.output
+                    if "```json" in item.output:
+                        parts = item.output.split("```json")
+                        if len(parts) > 1:
+                            json_str = parts[1].split("```")[0].strip()
+                    
+                    try:
+                        tool_result = json.loads(json_str)
+                        if isinstance(tool_result, dict) and "success" in tool_result:
+                            # Extract dataframe and images from tool result
+                            if isinstance(tool_result.get("dataframe"), list) and tool_result.get("dataframe"):
+                                extracted_df = tool_result.get("dataframe")
+                            if isinstance(tool_result.get("images"), list) and tool_result.get("images"):
+                                extracted_images = tool_result.get("images")
+                            break  # Found the JSON, no need to continue
+                    except (json.JSONDecodeError, ValueError):
+                        continue
 
-            # Primo tentativo: direttamente con l'agente Excel
-            logger.info("MasterAgent: Primo tentativo con ExcelAnalysisAgent")
-            first_result = excel.analyze(user_query=user_query, file_path=file_path)
-            if first_result.get("success") and (
-                (first_result.get("output") and first_result["output"].strip())
-                or first_result.get("dataframe")
-                or (first_result.get("images") and len(first_result["images"]) > 0)
-            ):
-                return first_result
-
-            # Se fallisce, raccogli contesto dal WebSearchAgent
-            logger.info("MasterAgent: Primo tentativo insufficiente, avvio WebSearchAgent per contesto")
-            web_context = self._run_web_search(
-                f"User query: {user_query}. If available, include pandas/matplotlib guidance."
-            ) or ""
-
-            # Secondo tentativo: arricchisci la richiesta per l'agente Excel
-            augmented_query = (
-                f"{user_query}\n\nAdditional guidance from web research:\n{web_context}\n\n"
-                "Use this guidance to write correct Python code and call execute_python_code."
-            )
-            logger.info("MasterAgent: Secondo tentativo con ExcelAnalysisAgent usando contesto web")
-            second_result = excel.analyze(user_query=augmented_query, file_path=file_path)
-
-            # Allegare il contesto web all'output testuale per visibilità
-            if web_context:
-                base_output = second_result.get("output") or ""
-                combined = base_output + ("\n\n---\nWeb research context used:\n" + web_context if web_context else "")
-                second_result["output"] = combined
-
-            return second_result
+            return {
+                'success': True,
+                'output': final_text,
+                'dataframe': extracted_df,
+                'images': extracted_images,
+                'code': None,
+                'error': None
+            }
 
         except Exception as e:
             err = f"MasterAgent error: {e}"
