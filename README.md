@@ -2,6 +2,9 @@
 
 An intelligent Excel data analysis application powered by AI. Upload your Excel or CSV files and analyze them using natural language queries in English.
 
+### 🌐 Try the Live Demo
+- 🔗 **[Live Demo on Hugging Face Spaces](https://huggingface.co/spaces/devsu/excel-analyst-agent)**
+
 ## 🌟 Features
 
 - **Natural Language Queries**: Describe what you want in plain English
