@@ -1,25 +1,29 @@
 """
-Python Sandbox Tool for safe code execution
-Uses standard exec() with AST validation and namespace control
+Python execution tool for LLM-generated analysis code.
+
+The code never runs in the app's own process. ``PythonSandboxTool`` first checks it with an AST
+validator (a fast, friendly first filter, not the security boundary), then runs it in a separate
+locked-down process (see ``sandbox_worker.py``): empty environment, throw-away working folder,
+resource limits, an audit hook for network/subprocess/file access, and a hard timeout that kills
+the whole process group.
 """
 
-import io
-import sys
-import base64
-import logging
 import ast
-from typing import Dict, Any, Optional, Set
-from contextlib import redirect_stdout, redirect_stderr
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')  # Non-interactive backend
-import matplotlib.pyplot as plt
-import seaborn as sns
+import json
+import logging
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, Optional, Set
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+WORKER_PATH = Path(__file__).with_name("sandbox_worker.py")
+MAX_RESULT_BYTES = 20 * 1024 * 1024
 
 
 class TimeoutException(Exception):
@@ -82,313 +86,114 @@ class CodeValidator(ast.NodeVisitor):
 
 
 class PythonSandboxTool:
-    """
-    Safe Python code execution sandbox with restricted access
-    """
-    
-    def __init__(self, timeout: int = 30):
+    """Runs analysis code in an isolated child process and returns its result."""
+
+    def __init__(self, timeout: int = 30, memory_mb: int = 4096):
         """
-        Initialize the sandbox tool
-        
         Args:
-            timeout: Maximum execution time in seconds (default: 30)
+            timeout: Maximum execution time in seconds; the process is killed after it.
+            memory_mb: Address-space limit for the child process.
         """
         self.timeout = timeout
-        self.allowed_modules = {
-            'pd': pd,
-            'pandas': pd,
-            'np': np,
-            'numpy': np,
-            'plt': plt,
-            'matplotlib': matplotlib,
-            'sns': sns,
-            'seaborn': sns,
+        self.memory_mb = memory_mb
+
+    @staticmethod
+    def _child_env(workdir: str, mpl_dir: str) -> Dict[str, str]:
+        """Environment for the child: nothing from the parent, so no API key can leak."""
+        return {
+            "HOME": workdir,
+            "MPLCONFIGDIR": mpl_dir,
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "PYTHONHASHSEED": "0",
+            "LANG": "C.UTF-8",
         }
-    
-    def _safe_import(self, name, globals=None, locals=None, fromlist=(), level=0):
-        """
-        Custom import function that uses pre-loaded modules
-        
-        Args:
-            name: Module name to import
-            globals: Global namespace (ignored)
-            locals: Local namespace (ignored)
-            fromlist: Names to import from module
-            level: Relative import level
-            
-        Returns:
-            Pre-loaded module object if allowed
-            
-        Raises:
-            ImportError: If module is not allowed
-        """
-        # Map import names to allowed modules
-        allowed = {
-            'pandas': pd,
-            'numpy': np,
-            'matplotlib': matplotlib,
-            'seaborn': sns,
-        }
-        
-        # Return pre-loaded module if allowed
-        if name in allowed:
-            return allowed[name]
-        
-        # Handle matplotlib sub-modules (e.g., matplotlib.pyplot)
-        if name.startswith('matplotlib.'):
-            # Return the base matplotlib module
-            # Python will then access the sub-module as an attribute
-            return matplotlib
-        
-        # Check if it's a blocked module
-        if name.split('.')[0] in CodeValidator.BLOCKED_MODULES:
-            raise ImportError(f"Import of '{name}' is not allowed for security reasons")
-        
-        # For any other module not specifically allowed, raise error
-        raise ImportError(f"Cannot import '{name}'. Only pandas, numpy, matplotlib, and seaborn are allowed.")
-    
-    def _create_safe_globals(self, file_path: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Create a safe globals dictionary with whitelisted modules
-        
-        Args:
-            file_path: Path to the uploaded Excel/CSV file
-            
-        Returns:
-            Dictionary of safe globals
-        """
-        # Create a limited builtins dictionary
-        safe_builtins = {
-            'print': print,
-            'len': len,
-            'range': range,
-            'enumerate': enumerate,
-            'zip': zip,
-            'map': map,
-            'filter': filter,
-            'sum': sum,
-            'min': min,
-            'max': max,
-            'abs': abs,
-            'round': round,
-            'sorted': sorted,
-            'list': list,
-            'dict': dict,
-            'set': set,
-            'tuple': tuple,
-            'str': str,
-            'int': int,
-            'float': float,
-            'bool': bool,
-            'isinstance': isinstance,
-            'type': type,
-            'hasattr': hasattr,
-            'getattr': getattr,
-            'setattr': setattr,
-            'True': True,
-            'False': False,
-            'None': None,
-            '__import__': self._safe_import,  # Enable safe imports
-            # Exception types (necessary for try/except blocks)
-            'Exception': Exception,
-            'ValueError': ValueError,
-            'TypeError': TypeError,
-            'KeyError': KeyError,
-            'IndexError': IndexError,
-            'AttributeError': AttributeError,
-            'RuntimeError': RuntimeError,
-            'ImportError': ImportError,
-            'ZeroDivisionError': ZeroDivisionError,
-            # Additional useful builtins
-            'locals': locals,
-            'globals': lambda: safe_builtins,  # Return safe version
-            'dir': dir,
-            'any': any,
-            'all': all,
-        }
-        
-        safe_dict = {
-            '__builtins__': safe_builtins,
-            '__name__': 'sandbox',
-        }
-        
-        # Add allowed modules (also available directly without import)
-        safe_dict.update(self.allowed_modules)
-        
-        # Add file path if provided
-        if file_path:
-            safe_dict['file_path'] = file_path
-            
-        return safe_dict
-    
-    def _execute_code(self, byte_code, safe_dict, stdout_capture, stderr_capture) -> None:
-        """
-        Helper method to execute code (can be run in a separate thread)
-        
-        Args:
-            byte_code: Compiled code object
-            safe_dict: Safe globals dictionary
-            stdout_capture: StringIO for capturing stdout
-            stderr_capture: StringIO for capturing stderr
-        """
-        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-            exec(byte_code, safe_dict)
-    
+
     def execute(self, code: str, file_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Execute Python code in a restricted environment
-        
+        Execute Python code in a restricted child process
+
         Args:
             code: Python code to execute
-            file_path: Path to the uploaded Excel/CSV file
-            
+            file_path: Path to the uploaded Excel/CSV file. The code sees a private copy.
+
         Returns:
             Dictionary containing:
                 - success: bool
                 - output: str (stdout)
                 - error: str (if any)
-                - dataframe: dict (if df variable exists)
-                - images: list of base64 encoded images
+                - dataframe: list of records (if a ``df`` or ``result`` DataFrame exists)
+                - images: list of base64 encoded PNG images
         """
-        result = {
-            'success': False,
-            'output': '',
-            'error': '',
-            'dataframe': None,
-            'images': []
-        }
-        
+        result = {"success": False, "output": "", "error": "", "dataframe": None, "images": []}
+
         try:
-            # Validate code using AST
+            tree = ast.parse(code, filename="<user_code>", mode="exec")
+        except SyntaxError as e:
+            result["error"] = f"Syntax error: {str(e)}"
+            logger.error("Syntax error: %s", e)
+            return result
+
+        validator = CodeValidator()
+        validator.visit(tree)
+        if validator.errors:
+            result["error"] = "Security validation failed:\n" + "\n".join(validator.errors)
+            logger.error("Validation errors: %s", validator.errors)
+            return result
+
+        mpl_dir = os.path.join(tempfile.gettempdir(), "excel-agent-mpl")
+        os.makedirs(mpl_dir, mode=0o700, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="excel-agent-") as workdir:
+            os.chmod(workdir, 0o700)
+            private_file = None
+            if file_path:
+                if not os.path.isfile(file_path):
+                    result["error"] = f"Input file not found: {file_path}"
+                    return result
+                private_file = os.path.join(workdir, "input" + Path(file_path).suffix.lower())
+                shutil.copyfile(file_path, private_file)
+
+            request = {
+                "code": code,
+                "file_path": private_file,
+                "timeout": self.timeout,
+                "memory_mb": self.memory_mb,
+            }
+            Path(workdir, "request.json").write_text(json.dumps(request), encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [sys.executable, "-I", str(WORKER_PATH), workdir],
+                cwd=workdir,
+                env=self._child_env(workdir, mpl_dir),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
             try:
-                tree = ast.parse(code, filename='<user_code>', mode='exec')
-            except SyntaxError as e:
-                result['error'] = f"Syntax error: {str(e)}"
-                logger.error(f"Syntax error: {str(e)}")
+                _, stderr = proc.communicate(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                result["error"] = f"Execution timeout: Code took longer than {self.timeout} seconds"
+                logger.error("Timeout: code execution exceeded %s seconds", self.timeout)
                 return result
-            
-            # Check for dangerous operations
-            validator = CodeValidator()
-            validator.visit(tree)
-            
-            if validator.errors:
-                result['error'] = f"Security validation failed:\n" + "\n".join(validator.errors)
-                logger.error(f"Validation errors: {validator.errors}")
+
+            result_path = Path(workdir, "result.json")
+            if not result_path.is_file() or result_path.stat().st_size > MAX_RESULT_BYTES:
+                tail = (stderr or b"").decode("utf-8", "replace")[-500:]
+                reason = "memory or CPU limit reached" if proc.returncode and proc.returncode < 0 else "worker failed"
+                result["error"] = f"Sandbox error: {reason} (exit code {proc.returncode}). {tail}".strip()
+                logger.error(result["error"])
                 return result
-            
-            # Configure pandas display to avoid truncated columns/rows in printed output
-            try:
-                pd.set_option('display.max_columns', None)
-                pd.set_option('display.width', 2000)
-                pd.set_option('display.max_colwidth', None)
-                pd.set_option('display.expand_frame_repr', False)
-            except Exception:
-                pass
 
-            # Compile the validated code
-            byte_code = compile(tree, filename='<user_code>', mode='exec')
-            
-            # Create safe execution environment
-            safe_dict = self._create_safe_globals(file_path)
-            
-            # Capture stdout and stderr
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
-            
-            # Execute with timeout using ThreadPoolExecutor
-            try:
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        self._execute_code,
-                        byte_code,
-                        safe_dict,
-                        stdout_capture,
-                        stderr_capture
-                    )
-                    # Wait for completion with timeout
-                    future.result(timeout=self.timeout)
-                
-                # Get stdout
-                result['output'] = stdout_capture.getvalue()
-                
-                # Check for dataframe in the namespace
-                if 'df' in safe_dict and isinstance(safe_dict['df'], pd.DataFrame):
-                    # Convert dataframe to dict and make it JSON-safe
-                    records = safe_dict['df'].head(5).to_dict('records')
-                    result['dataframe'] = self._make_json_safe_records(records)
-                elif 'result' in safe_dict and isinstance(safe_dict['result'], pd.DataFrame):
-                    records = safe_dict['result'].head(5).to_dict('records')
-                    result['dataframe'] = self._make_json_safe_records(records)
-                
-                # Capture matplotlib figures
-                figures = [plt.figure(i) for i in plt.get_fignums()]
-                for fig in figures:
-                    buf = io.BytesIO()
-                    fig.savefig(buf, format='png', bbox_inches='tight', dpi=100)
-                    buf.seek(0)
-                    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
-                    result['images'].append(img_base64)
-                    buf.close()
-                
-                # Close all figures to free memory
-                plt.close('all')
-                
-                result['success'] = True
-                logger.info("Code executed successfully")
-                
-            except FuturesTimeoutError:
-                result['error'] = f"Execution timeout: Code took longer than {self.timeout} seconds"
-                logger.error(f"Timeout: Code execution exceeded {self.timeout} seconds")
-            except Exception as e:
-                result['error'] = f"Runtime error: {str(e)}"
-                logger.error(f"Runtime error: {str(e)}")
-                
-                # Include stderr if available
-                stderr_output = stderr_capture.getvalue()
-                if stderr_output:
-                    result['error'] += f"\n{stderr_output}"
-        
-        except Exception as e:
-            result['error'] = f"Sandbox error: {str(e)}"
-            logger.error(f"Sandbox error: {str(e)}")
+            loaded = json.loads(result_path.read_text(encoding="utf-8"))
+            result.update(loaded)
+            logger.info("Code executed: success=%s", result["success"])
+            return result
 
-        logger.info(f"Result: {result}")
-        
-        return result
-
-    def _make_json_safe_records(self, records):
-        """
-        Convert a list of dict records into JSON-serializable values:
-        - pandas.Timestamp -> ISO string
-        - numpy types -> native Python
-        - NaN -> None
-        """
-        import math
-        from datetime import datetime
-
-        def to_safe(value):
-            if isinstance(value, pd.Timestamp):
-                return value.isoformat()
-            if isinstance(value, datetime):
-                return value.isoformat()
-            if isinstance(value, np.generic):
-                # numpy scalar -> native python
-                py = value.item()
-                if isinstance(py, float) and (math.isnan(py) or py == float('inf') or py == float('-inf')):
-                    return None
-                return py
-            if isinstance(value, float):
-                if math.isnan(value) or value == float('inf') or value == float('-inf'):
-                    return None
-                return value
-            return value
-
-        safe_records = []
-        for rec in records or []:
-            safe_rec = {k: to_safe(v) for k, v in rec.items()}
-            safe_records.append(safe_rec)
-        return safe_records
-    
     def get_tool_definition(self) -> Dict[str, Any]:
         """
         Get the tool definition for OpenAI function calling
@@ -413,6 +218,3 @@ class PythonSandboxTool:
                 }
             }
         }
-
-
-

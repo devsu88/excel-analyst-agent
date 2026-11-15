@@ -4,7 +4,6 @@ MCP stdio server exposing execute_python_code and search_web tools (FastMCP)
 
 from fastmcp import FastMCP
 
-
 mcp = FastMCP("excel-tools")
 
 # Lazy singletons to avoid heavy imports at startup

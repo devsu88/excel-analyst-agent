@@ -12,7 +12,7 @@ An intelligent Excel data analysis application powered by AI. Upload your Excel 
 - **Data Analysis**: Perform complex data manipulation and statistical analysis
 - **Visualizations**: Automatic chart and graph generation
 - **Multi-Agent System**: MasterAgent coordinates ExcelAnalysisAgent and WebSearchAgent
-- **Secure Execution**: Sandboxed Python environment with restricted access
+- **Isolated Execution**: generated code runs in a separate, locked-down process (see [Security](#-security))
 - **User-Friendly Interface**: Clean Gradio web interface
 
 ## 🏗️ Architecture
@@ -68,7 +68,8 @@ excel-analyst-agent/
     ├── mcp_server.py               # MCP stdio server (FastMCP)
     └── tools/
         ├── __init__.py
-        ├── python_tool.py          # Python Sandbox with AST validation
+        ├── python_tool.py          # AST validation + sandbox launcher
+        ├── sandbox_worker.py       # locked-down child process that runs the code
         └── web_search_tool.py      # DuckDuckGo search integration
 ```
 
@@ -96,7 +97,7 @@ excel-analyst-agent/
    - Tool filtering ensures each agent sees only its tools
 
 5. **Python Sandbox Tool** (`app_agents/tools/python_tool.py`)
-   - Secure execution with AST validation and controlled namespace
+   - AST validation, then execution in an isolated child process (`sandbox_worker.py`)
    - Supports pandas, numpy, matplotlib, seaborn
    - 30-second timeout and captures output/figures
 
@@ -203,7 +204,7 @@ return await Runner.run(excel_agent, msg, max_turns=20)
 1. Create a new Space on Hugging Face
 2. Choose "Gradio" as the SDK
 3. Upload all project files
-4. Add your `OPENAI_API_KEY` in the Space settings (Secrets)
+4. **Do not add an `OPENAI_API_KEY` secret**: each visitor enters their own key in the interface, so the Space holds nothing to steal and you pay nothing for other people's use
 5. The Space will automatically deploy
 
 ### Docker
@@ -233,36 +234,32 @@ docker run -p 7860:7860 -e OPENAI_API_KEY=your-key excel-analyst-agent
 
 ## 🔒 Security
 
-The application implements multiple security layers:
+The model writes Python and the app runs it, so the code is treated as untrusted. It never runs inside the app's
+own process. Layers, from the outside in:
 
-### AST Validation (Pre-execution)
-- Parses code before execution to detect dangerous operations
-- Blocks: `eval`, `exec`, `compile`, `open`, `os`, `sys`, `subprocess`, etc.
-- Allows only whitelisted imports: pandas, numpy, matplotlib, seaborn
+1. **AST validation** (friendly first filter, not the boundary): rejects `eval`, `exec`, `open`, `os`, `sys`,
+   `subprocess`, dunder access and imports other than pandas, numpy, matplotlib and seaborn, with a clear message
+   the agent can react to.
+2. **Separate process** (`app_agents/tools/sandbox_worker.py`), started with:
+   - an **empty environment**, so no API key or other secret exists in the process;
+   - a **throw-away working folder** holding a private copy of the uploaded file (the original is never touched);
+   - **resource limits**: CPU time, memory (4 GB by default) and maximum file size;
+   - a **hard timeout** that kills the whole process group.
+3. **Audit hook inside that process**: refuses network, subprocess, `exec` and `fork` calls, allows writing only in
+   the work folder, and allows reading only the work folder and the Python installation.
+4. **Restricted builtins and imports** for the generated code itself.
 
-### Controlled Namespace (Runtime)
-- Limited `__builtins__` with only safe functions
-- Custom `__import__` function for whitelisted modules only
-- No access to system functions or file operations (except uploaded file)
+All of this is covered by tests that start the real worker: reading the environment, reading `/etc/hostname`, running a
+shell command, writing outside the work folder, reaching the network, an infinite loop and a memory bomb are all stopped.
+Legitimate CSV, Excel, matplotlib and seaborn analyses run unchanged.
 
-### Execution Controls
-- **Timeout Protection**: 30-second execution limit via ThreadPoolExecutor
-- **File Access**: Limited to the uploaded file path only
-- **Thread Isolation**: Code runs in separate thread for safety
+**API keys.** Each request builds its own OpenAI client from the key in the interface; the key is never written to
+`os.environ`, which every session shares, and never logged. Agent tracing is disabled so prompts and data are not
+uploaded to OpenAI's trace service.
 
-### What is **BLOCKED**:
-- ❌ File system operations (`open`, `file`)
-- ❌ System commands (`os`, `sys`, `subprocess`)
-- ❌ Network access (`socket`, `urllib`, `requests`)
-- ❌ Dynamic code execution (`eval`, `exec`)
-- ❌ Dangerous imports (`pickle`, `marshal`)
-
-### What is **ALLOWED**:
-- ✅ pandas, numpy for data manipulation
-- ✅ matplotlib, seaborn for visualizations
-- ✅ Reading the uploaded file (`pd.read_excel(file_path)`)
-- ✅ Mathematical operations and statistics
-- ✅ Print statements for output
+**What this is not.** An in-process audit hook is strong defence in depth but not a hard boundary: a determined attacker
+with low-level (`ctypes`) tricks may still get out. For a public, multi-user deployment, run the app in a container with no
+secrets, no outbound network and a read-only filesystem, so the worker's isolation is the second line, not the only one.
 
 ## 📦 Dependencies
 
@@ -281,37 +278,17 @@ The application implements multiple security layers:
 
 ## 🔧 Technical Details
 
-### Why NOT RestrictedPython?
+### Why not RestrictedPython?
 
-Initially, RestrictedPython was considered but abandoned because:
-- Too restrictive for data analysis operations
-- Blocks legitimate pandas/numpy operations
-- Requires complex configuration for each library function
-- Doesn't support standard import statements well
+It was considered and dropped: it blocks legitimate pandas/numpy operations, needs configuration for each library
+function and handles standard imports poorly. Process isolation lets the analysis code use the libraries normally
+while the surrounding limits do the protecting.
 
-### Current Approach: AST Validation + Safe Namespace
+### Why a process and not a thread
 
-**Security Model**:
-1. **Parse code with `ast.parse()`** - Validates syntax
-2. **Walk the AST tree** - Check for dangerous operations
-3. **Compile if safe** - Standard Python `compile()`
-4. **Execute in controlled namespace** - Limited builtins + whitelisted modules
-5. **Timeout protection** - ThreadPoolExecutor with 30s limit
-
-**Code Validator** (in `python_tool.py`):
-```python
-class CodeValidator(ast.NodeVisitor):
-    # Blocks dangerous functions: eval, exec, open, os, sys, etc.
-    # Blocks dangerous modules: subprocess, socket, pickle, etc.
-    # Allows: pandas, numpy, matplotlib, seaborn imports
-```
-
-**Safe Import Handler**:
-- Custom `__import__` function in namespace
-- Maps import names to pre-loaded module objects
-- `import pandas as pd` → returns pre-loaded pandas module
-- `import matplotlib.pyplot as plt` → returns matplotlib.pyplot
-- Blocks any non-whitelisted imports
+The first version ran `exec()` in a thread of the app. A Python thread cannot be killed, so the timeout did not stop an
+infinite loop (the call waited for it), and the code shared the app's memory, environment and files. A separate process
+can be killed, limited and given nothing to steal.
 
 ### Execution Flow
 
@@ -338,6 +315,23 @@ User Query → Gradio UI → MasterAgent
                            ↓
                      Return results to UI
 ```
+
+## 🧪 Tests
+
+```bash
+pip install -r requirements.txt pytest
+pytest
+```
+
+The sandbox tests start the real worker process: normal analyses must work, escape attempts must fail. The agent
+tests check that API keys stay out of the shared environment. CI runs lint and tests on every push.
+
+## ⚠️ Limitations
+
+- The sandbox is defence in depth, not a guarantee; see [Security](#-security) for what to add in public deployments.
+- Linux/macOS only: the worker relies on POSIX resource limits and process groups.
+- Only pandas, numpy, matplotlib and seaborn are available to the generated code.
+- Results depend on the model writing correct code; the answer is the model's, so check important numbers.
 
 ## 🐛 Troubleshooting
 

@@ -2,21 +2,24 @@
 Master Agent - coordinates ExcelAnalysisAgent and WebSearchAgent as tools
 """
 
-import logging
-import os
 import asyncio
 import json
-from typing import Dict, Any, Optional
+import logging
+import sys
+from typing import Any, Dict
 
-from agents import Agent, Runner
+from agents import Agent, OpenAIResponsesModel, Runner, set_tracing_disabled
 from agents.mcp import MCPServerStdio, create_static_tool_filter
+from openai import AsyncOpenAI
 
 from .excel_agent import create_excel_agent
 from .web_agent import create_web_search_agent
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Traces would be uploaded to OpenAI and contain the user's data and prompts.
+set_tracing_disabled(True)
 
 
 MASTER_AGENT_PROMPT = """
@@ -43,9 +46,11 @@ class MasterAgent:
     """
 
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-        self.model = model
+        if not api_key:
+            raise ValueError("An OpenAI API key is required.")
+        # The key lives in this agent's own client. It is never written to os.environ, which every
+        # session shares: with several users at once they would overwrite each other's key.
+        self.model = OpenAIResponsesModel(model=model, openai_client=AsyncOpenAI(api_key=api_key))
 
     def analyze(self, user_query: str, file_path: str) -> Dict[str, Any]:
         """
@@ -55,7 +60,7 @@ class MasterAgent:
             # Create MCP servers
             python_server = MCPServerStdio(
                 name="excel-tools-python",
-                params={"command": "python", "args": ["-m", "app_agents.mcp_server"]},
+                params={"command": sys.executable, "args": ["-m", "app_agents.mcp_server"]},
                 cache_tools_list=True,
                 use_structured_content=True,
                 tool_filter=create_static_tool_filter(allowed_tool_names=["execute_python_code"]),
@@ -63,7 +68,7 @@ class MasterAgent:
             
             web_server = MCPServerStdio(
                 name="excel-tools-web",
-                params={"command": "python", "args": ["-m", "app_agents.mcp_server"]},
+                params={"command": sys.executable, "args": ["-m", "app_agents.mcp_server"]},
                 cache_tools_list=True,
                 tool_filter=create_static_tool_filter(allowed_tool_names=["search_web"]),
             )

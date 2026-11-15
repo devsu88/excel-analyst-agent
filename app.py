@@ -3,15 +3,17 @@ Excel Analyst Agent - Gradio Application
 Main entry point for the web interface
 """
 
-import os
-import logging
 import base64
+import logging
+import os
 from io import BytesIO
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
+
 import gradio as gr
 import pandas as pd
-from PIL import Image
 from dotenv import load_dotenv
+from PIL import Image
+
 from app_agents.master_agent import MasterAgent
 
 # Load environment variables
@@ -56,17 +58,8 @@ def process_analysis(
         
         # Get API key
         used_api_key = api_key if api_key else OPENAI_API_KEY
-        # Log presence (masked) of API key from UI/env for diagnostics
-        if api_key:
-            masked = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) >= 8 else "***"
-            logger.info(f"API key provided via UI: True (masked: {masked})")
-        else:
-            logger.info(f"API key provided via UI: False")
-            if OPENAI_API_KEY:
-                masked_env = f"{OPENAI_API_KEY[:4]}...{OPENAI_API_KEY[-4:]}" if len(OPENAI_API_KEY) >= 8 else "***"
-                logger.info(f"Using OPENAI_API_KEY from env: True (masked: {masked_env})")
-            else:
-                logger.info("Using OPENAI_API_KEY from env: False")
+        # Log only whether a key was provided, never any part of it
+        logger.info(f"API key provided via UI: {bool(api_key)}; available from env: {bool(OPENAI_API_KEY)}")
         if not used_api_key:
             return "❌ Please provide an OpenAI API key either in the interface or as an environment variable (OPENAI_API_KEY).", None, None
         
@@ -200,7 +193,7 @@ def create_interface() -> gr.Blocks:
                 
                 with gr.Row():
                     submit_btn = gr.Button("🚀 Analyze", variant="primary", size="lg")
-                    clear_btn = gr.ClearButton(
+                    gr.ClearButton(
                         components=[file_input, query_input, api_key_input],
                         value="🔄 Clear"
                     )

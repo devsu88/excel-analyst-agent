@@ -4,7 +4,8 @@ Provides web search capability for finding documentation and examples
 """
 
 import logging
-from typing import Dict, Any, List
+from typing import Any, Dict, List
+
 from ddgs import DDGS
 
 logging.basicConfig(level=logging.INFO)

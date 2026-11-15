@@ -5,9 +5,7 @@ Excel Analysis Agent - MCP client using Agents SDK
 import logging
 
 from agents import Agent
-from agents.mcp import MCPServerStdio, create_static_tool_filter
-from agents.model_settings import ModelSettings
-
+from agents.mcp import MCPServerStdio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -92,13 +90,13 @@ print(f"Median Sale Price: {median_price:.2f}")
 """
 
 
-def create_excel_agent(mcp_server: MCPServerStdio, model: str = "gpt-4o-mini") -> Agent:
+def create_excel_agent(mcp_server: MCPServerStdio, model="gpt-4o-mini") -> Agent:
     """
     Create an Agent SDK for Excel analysis
     
     Args:
         mcp_server: MCP server already configured with execute_python_code tool filter
-        model: OpenAI model to use
+        model: model name, or a model object bound to a specific client
     
     Returns:
         Agent configured for Excel analysis

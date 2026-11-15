@@ -5,9 +5,8 @@ WebSearch Agent - MCP client using Agents SDK
 import logging
 
 from agents import Agent
-from agents.mcp import MCPServerStdio, create_static_tool_filter
+from agents.mcp import MCPServerStdio
 from agents.model_settings import ModelSettings
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,13 +35,13 @@ YOUR CODE HERE
 """
 
 
-def create_web_search_agent(mcp_server: MCPServerStdio, model: str = "gpt-4o-mini") -> Agent:
+def create_web_search_agent(mcp_server: MCPServerStdio, model="gpt-4o-mini") -> Agent:
     """
     Create an Agent SDK for web search
     
     Args:
         mcp_server: MCP server already configured with search_web tool filter
-        model: OpenAI model to use
+        model: model name, or a model object bound to a specific client
     
     Returns:
         Agent configured for web search
