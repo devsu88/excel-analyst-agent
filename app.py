@@ -32,6 +32,19 @@ if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not found in environment variables")
 
 
+def resolve_api_key(ui_key: Optional[str], env_key: Optional[str], on_space: bool) -> Optional[str]:
+    """Pick the OpenAI key for a request.
+
+    On a public Hugging Face Space (``SPACE_ID`` is set automatically there) only the key the visitor typed
+    is used, even if the Space happens to have an ``OPENAI_API_KEY`` secret: nobody should spend the
+    owner's credit. Locally, the key from the environment is the fallback.
+    """
+    ui_key = (ui_key or "").strip()
+    if ui_key:
+        return ui_key
+    return None if on_space else env_key
+
+
 def process_analysis(
     file: Optional[gr.File],
     query: str,
@@ -57,12 +70,15 @@ def process_analysis(
             return "❌ Please enter a query describing what you want to analyze.", None, None
         
         # Get API key
-        used_api_key = api_key if api_key else OPENAI_API_KEY
+        on_space = bool(os.getenv("SPACE_ID"))
+        used_api_key = resolve_api_key(api_key, OPENAI_API_KEY, on_space)
         # Log only whether a key was provided, never any part of it
-        logger.info(f"API key provided via UI: {bool(api_key)}; available from env: {bool(OPENAI_API_KEY)}")
+        logger.info(f"API key provided via UI: {bool(api_key)}; using env key: {bool(used_api_key) and not api_key}")
         if not used_api_key:
+            if on_space:
+                return "❌ Please enter your own OpenAI API key. It is used only for your request and never stored.", None, None
             return "❌ Please provide an OpenAI API key either in the interface or as an environment variable (OPENAI_API_KEY).", None, None
-        
+
         # Get file path
         file_path = file.name
         logger.info(f"Processing file: {file_path}")

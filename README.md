@@ -1,3 +1,16 @@
+---
+title: Excel Analyst Agent
+emoji: 📊
+colorFrom: pink
+colorTo: pink
+sdk: gradio
+sdk_version: 6.32.0
+python_version: "3.11"
+app_file: app.py
+pinned: false
+short_description: Ask questions about Excel/CSV files in plain English
+---
+
 # 📊 Excel Analyst Agent
 
 An intelligent Excel data analysis application powered by AI. Upload your Excel or CSV files and analyze them using natural language queries in English.
@@ -204,8 +217,13 @@ return await Runner.run(excel_agent, msg, max_turns=20)
 1. Create a new Space on Hugging Face
 2. Choose "Gradio" as the SDK
 3. Upload all project files
-4. **Do not add an `OPENAI_API_KEY` secret**: each visitor enters their own key in the interface, so the Space holds nothing to steal and you pay nothing for other people's use
-5. The Space will automatically deploy
+4. **Do not add an `OPENAI_API_KEY` secret**: each visitor enters their own key in the interface, so the Space holds nothing to steal and you pay nothing for other people's use. On a Space the app ignores any such secret anyway (`resolve_api_key` in `app.py`)
+5. The configuration is the front matter at the top of this README (SDK, version, Python 3.11); the Space installs `requirements.txt`
+6. To publish a new version, add the Space as a remote once (`git remote add hf git@hf.co:spaces/devsu/excel-analyst-agent`, then `git fetch hf`) and push a snapshot commit on top of the Space's history:
+
+```bash
+git push hf "$(git commit-tree HEAD^{tree} -p hf/main -m "Deploy $(git rev-parse --short HEAD)")":refs/heads/main
+```
 
 ### Docker
 
